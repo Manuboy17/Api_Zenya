@@ -25,16 +25,43 @@ with open('clases.txt', 'r') as f:
     CLASSES = [line.strip() for line in f.readlines()]
 
 def preprocess_image(image_base64):
-    """Preprocesar imagen base64 para el modelo"""
-    image_data = base64.b64decode(image_base64)
-    image = Image.open(io.BytesIO(image_data))
-    image = image.convert('RGB')
-    image_np = np.array(image)
-    image_resized = cv2.resize(image_np, (640, 640))
-    image_normalized = image_resized.astype(np.float32) / 255.0
-    image_transposed = np.transpose(image_normalized, (2, 0, 1))
-    image_batch = np.expand_dims(image_transposed, axis=0)
-    return image_batch
+    """Preprocesar imagen base64 para el modelo YOLO"""
+    try:
+        # Decodificar base64
+        image_data = base64.b64decode(image_base64)
+        image = Image.open(io.BytesIO(image_data))
+        image = image.convert('RGB')
+        image_np = np.array(image)
+        
+        # ⚡ NUEVO: Redimensionar conservando aspect ratio
+        h, w = image_np.shape[:2]
+        scale = min(640/w, 640/h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Redimensionar
+        image_resized = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Crear canvas 640x640 negro
+        canvas = np.zeros((640, 640, 3), dtype=np.uint8)
+        
+        # Centrar imagen en canvas
+        top = (640 - new_h) // 2
+        left = (640 - new_w) // 2
+        canvas[top:top+new_h, left:left+new_w] = image_resized
+        
+        # Normalizar y transponer
+        image_normalized = canvas.astype(np.float32) / 255.0
+        image_transposed = np.transpose(image_normalized, (2, 0, 1))
+        image_batch = np.expand_dims(image_transposed, axis=0)
+        
+        print(f"📐 Preprocesado: Original {w}x{h} → Resized {new_w}x{new_h} → Canvas 640x640")
+        
+        return image_batch
+        
+    except Exception as e:
+        print(f"❌ Error en preprocesamiento: {str(e)}")
+        raise
 
 def apply_nms(boxes, scores, iou_threshold=0.45):
     """Non-Maximum Suppression"""
@@ -105,7 +132,8 @@ def predict():
     try:
         data = request.get_json()
         image_base64 = data.get('image')
-        confidence_threshold = data.get('confidence', 0.3)  # Bajado a 0.3
+        confidence_threshold = data.get('confidence', 0.1)  # ← Bajar a 0.1
+
         iou_threshold = data.get('iou_threshold', 0.45)
         
         if not image_base64:
