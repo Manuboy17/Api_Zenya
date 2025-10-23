@@ -21,7 +21,7 @@ MODEL = ort.InferenceSession('best.onnx', session_options)
 print("✅ Modelo cargado y optimizado")
 
 # Cargar clases
-with open('classes.txt', 'r') as f:
+with open('clases.txt', 'r') as f:
     CLASSES = [line.strip() for line in f.readlines()]
 
 def preprocess_image(image_base64):
