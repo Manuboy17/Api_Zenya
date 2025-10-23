@@ -27,32 +27,33 @@ print(f"📚 {len(CLASSES)} clases cargadas")
 
 def preprocess_image(image_base64):
     """
-    Preprocesamiento compatible con YOLOv5/v8
-    Formato estándar: RGB, 0-255, sin normalización
+    Preprocesamiento NORMALIZADO (0-1)
+    La mayoría de modelos YOLO se entrenan así
     """
     try:
-        # Decodificar base64
         image_data = base64.b64decode(image_base64)
         image = Image.open(io.BytesIO(image_data))
         image = image.convert('RGB')
         image_np = np.array(image)
         
-        # Redimensionar a 640x640 directamente (sin padding)
+        # Redimensionar
         image_resized = cv2.resize(image_np, (640, 640), interpolation=cv2.INTER_LINEAR)
         
-        # Formato YOLO: [batch, channels, height, width]
-        # Rango: 0-255 (sin normalizar)
-        image_transposed = np.transpose(image_resized, (2, 0, 1))  # HWC → CHW
-        image_batch = np.expand_dims(image_transposed, axis=0)  # Agregar batch
-        image_final = image_batch.astype(np.float32)  # Float32
+        # ⚡ NORMALIZAR A [0, 1]
+        image_normalized = image_resized.astype(np.float32) / 255.0
         
-        print(f"📐 Shape: {image_final.shape}, Range: [{image_final.min():.0f}-{image_final.max():.0f}]")
+        # Transponer
+        image_transposed = np.transpose(image_normalized, (2, 0, 1))
+        image_batch = np.expand_dims(image_transposed, axis=0)
         
-        return image_final
+        print(f"📐 Normalizado [0-1]: Shape {image_batch.shape}, Range [{image_batch.min():.3f}-{image_batch.max():.3f}]")
+        
+        return image_batch
         
     except Exception as e:
-        print(f"❌ Error preprocesamiento: {str(e)}")
+        print(f"❌ Error: {str(e)}")
         raise
+
 
 def apply_nms(boxes, scores, iou_threshold=0.45):
     """Non-Maximum Suppression"""
