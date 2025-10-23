@@ -1,213 +1,173 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import onnxruntime as ort
 import numpy as np
-from PIL import Image
+import cv2
 import base64
+from PIL import Image
 import io
-from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# Cargar nombres de clases (letras)
-try:
-    with open('clases.txt', 'r', encoding='utf-8') as f:
-        class_names = [line.strip() for line in f.readlines()]
-    print(f"✓ Clases cargadas: {class_names}")
-except:
-    class_names = []
-    print("⚠ No se encontró classes.txt")
+# ✅ CARGAR MODELO UNA SOLA VEZ (CACHE GLOBAL)
+print("🔄 Cargando modelo ONNX...")
+session_options = ort.SessionOptions()
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+session_options.intra_op_num_threads = 2  # Usar tus 2 vCPU
+session_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
 
-# Cargar modelo ONNX
-try:
-    session = ort.InferenceSession('best.onnx')
-    print("✓ Modelo ONNX cargado correctamente")
-    input_shape = session.get_inputs()[0].shape
-    print(f"Forma de entrada esperada: {input_shape}")
-except Exception as e:
-    print(f"✗ Error al cargar el modelo: {e}")
-    session = None
+MODEL = ort.InferenceSession('best.onnx', session_options)
+print("✅ Modelo cargado y optimizado")
 
-def preprocess_image(image_data, input_size=640):
-    """Preprocesa la imagen para YOLO usando PIL"""
-    try:
-        img_bytes = base64.b64decode(image_data)
-        img = Image.open(io.BytesIO(img_bytes))
-        
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        original_size = img.size
-        img = img.resize((input_size, input_size))
-        img_array = np.array(img, dtype=np.float32)
-        img_array = img_array / 255.0
-        img_array = np.transpose(img_array, (2, 0, 1))
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        return img_array, original_size
-    except Exception as e:
-        raise ValueError(f"Error al preprocesar imagen: {str(e)}")
+# Cargar clases
+with open('classes.txt', 'r') as f:
+    CLASSES = [line.strip() for line in f.readlines()]
 
-def calculate_iou(box1, box2):
-    """Calcula Intersection over Union entre dos cajas"""
-    x1, y1, w1, h1 = box1
-    x2, y2, w2, h2 = box2
-    
-    # Convertir de (center_x, center_y, width, height) a (x1, y1, x2, y2)
-    box1_x1 = x1 - w1/2
-    box1_y1 = y1 - h1/2
-    box1_x2 = x1 + w1/2
-    box1_y2 = y1 + h1/2
-    
-    box2_x1 = x2 - w2/2
-    box2_y1 = y2 - h2/2
-    box2_x2 = x2 + w2/2
-    box2_y2 = y2 + h2/2
-    
-    # Calcular intersección
-    xi1 = max(box1_x1, box2_x1)
-    yi1 = max(box1_y1, box2_y1)
-    xi2 = min(box1_x2, box2_x2)
-    yi2 = min(box1_y2, box2_y2)
-    
-    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-    
-    # Calcular unión
-    box1_area = w1 * h1
-    box2_area = w2 * h2
-    union_area = box1_area + box2_area - inter_area
-    
-    if union_area == 0:
-        return 0
-    
-    return inter_area / union_area
+def preprocess_image(image_base64):
+    """Preprocesar imagen base64 para el modelo"""
+    image_data = base64.b64decode(image_base64)
+    image = Image.open(io.BytesIO(image_data))
+    image = image.convert('RGB')
+    image_np = np.array(image)
+    image_resized = cv2.resize(image_np, (640, 640))
+    image_normalized = image_resized.astype(np.float32) / 255.0
+    image_transposed = np.transpose(image_normalized, (2, 0, 1))
+    image_batch = np.expand_dims(image_transposed, axis=0)
+    return image_batch
 
-def non_max_suppression(boxes, scores, class_ids, iou_threshold=0.45):
-    """Aplica Non-Maximum Suppression para eliminar detecciones duplicadas"""
+def apply_nms(boxes, scores, iou_threshold=0.45):
+    """Non-Maximum Suppression"""
     if len(boxes) == 0:
-        return [], [], []
+        return []
     
-    # Ordenar por score descendente
-    indices = np.argsort(scores)[::-1]
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
     
-    keep_boxes = []
-    keep_scores = []
-    keep_class_ids = []
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
     
-    while len(indices) > 0:
-        # Mantener la caja con mayor score
-        current = indices[0]
-        keep_boxes.append(boxes[current])
-        keep_scores.append(scores[current])
-        keep_class_ids.append(class_ids[current])
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
         
-        if len(indices) == 1:
-            break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
         
-        # Calcular IoU con el resto de cajas
-        rest_indices = indices[1:]
-        ious = [calculate_iou(boxes[current], boxes[i]) for i in rest_indices]
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
         
-        # Mantener solo las cajas con IoU bajo (no superpuestas)
-        indices = rest_indices[np.array(ious) < iou_threshold]
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
     
-    return keep_boxes, keep_scores, keep_class_ids
+    return keep
 
-def postprocess_predictions(output, conf_threshold=0.5, iou_threshold=0.45, target_classes=None):
-    """Post-procesa las predicciones de YOLO con NMS"""
-    predictions = output[0]
-    predictions = predictions.transpose()
-    
-    boxes = []
-    scores = []
-    class_ids = []
-    
-    # Primera fase: filtrar por confianza y clase
-    for pred in predictions:
-        x, y, w, h = pred[:4]
-        class_scores = pred[4:]
-        
-        class_id = np.argmax(class_scores)
-        confidence = class_scores[class_id]
-        
-        if target_classes is not None:
-            if class_id not in target_classes:
-                continue
-        
-        if confidence > conf_threshold:
-            boxes.append([float(x), float(y), float(w), float(h)])
-            scores.append(float(confidence))
-            class_ids.append(int(class_id))
-    
-    # Segunda fase: aplicar NMS
-    if len(boxes) > 0:
-        boxes, scores, class_ids = non_max_suppression(
-            boxes, scores, class_ids, iou_threshold
-        )
-    
-    # Convertir class_ids a letras
-    letters = []
-    for class_id in class_ids:
-        if class_id < len(class_names):
-            letters.append(class_names[class_id])
-        else:
-            letters.append(f"clase_{class_id}")
-    
-    return {
-        'num_detections': len(boxes),
-        'boxes': boxes,
-        'scores': scores,
-        'class_ids': class_ids,
-        'letters': letters
-    }
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "online",
+        "message": "API de detección de lengua de señas",
+        "model": "YOLO ONNX optimizado",
+        "version": "2.0"
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "model_loaded": MODEL is not None})
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if session is None:
-        return jsonify({'error': 'Modelo no cargado'}), 500
-    
     try:
-        data = request.json
-        
-        if 'image' not in data:
-            return jsonify({'error': 'No se encontró el campo "image"'}), 400
-        
-        target_classes = data.get('classes', None)
-        conf_threshold = data.get('confidence', 0.5)
+        data = request.get_json()
+        image_base64 = data.get('image')
+        confidence_threshold = data.get('confidence', 0.5)
         iou_threshold = data.get('iou_threshold', 0.45)
         
-        input_data, original_size = preprocess_image(data['image'])
+        if not image_base64:
+            return jsonify({'success': False, 'error': 'No image provided'}), 400
         
-        input_name = session.get_inputs()[0].name
-        outputs = session.run(None, {input_name: input_data})
+        # Preprocesar
+        input_tensor = preprocess_image(image_base64)
         
-        results = postprocess_predictions(
-            outputs[0], 
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-            target_classes=target_classes
-        )
+        # ⚡ INFERENCIA RÁPIDA (modelo ya cargado)
+        outputs = MODEL.run(None, {MODEL.get_inputs()[0].name: input_tensor})
+        predictions = outputs[0][0]
+        
+        # Post-procesamiento
+        boxes = []
+        scores = []
+        class_ids = []
+        
+        for detection in predictions.T:
+            confidence = detection[4]
+            if confidence > confidence_threshold:
+                class_scores = detection[5:]
+                class_id = np.argmax(class_scores)
+                class_confidence = class_scores[class_id]
+                
+                if class_confidence > confidence_threshold:
+                    x_center, y_center, width, height = detection[0:4]
+                    x1 = x_center - width / 2
+                    y1 = y_center - height / 2
+                    x2 = x_center + width / 2
+                    y2 = y_center + height / 2
+                    
+                    boxes.append([x1, y1, x2, y2])
+                    scores.append(float(class_confidence))
+                    class_ids.append(int(class_id))
+        
+        # NMS
+        if len(boxes) > 0:
+            boxes = np.array(boxes)
+            scores = np.array(scores)
+            keep_indices = apply_nms(boxes, scores, iou_threshold)
+            
+            final_boxes = boxes[keep_indices].tolist()
+            final_scores = [scores[i] for i in keep_indices]
+            final_class_ids = [class_ids[i] for i in keep_indices]
+            final_letters = [CLASSES[i] for i in final_class_ids]
+            
+            return jsonify({
+                'success': True,
+                'detections': {
+                    'num_detections': len(keep_indices),
+                    'boxes': final_boxes,
+                    'scores': final_scores,
+                    'class_ids': final_class_ids,
+                    'letters': final_letters
+                }
+            })
         
         return jsonify({
             'success': True,
-            'detections': results,
-            'original_image_size': original_size,
-            'message': f'Letras detectadas: {", ".join(results["letters"])}'
+            'detections': {
+                'num_detections': 0,
+                'boxes': [],
+                'scores': [],
+                'class_ids': [],
+                'letters': []
+            }
         })
+        
     except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({
-        'message': 'API de reconocimiento de lengua de señas',
-        'clases_disponibles': class_names,
-        'total_clases': len(class_names),
-        'endpoint': '/predict',
-        'method': 'POST'
-    })
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    return response
 
 if __name__ == '__main__':
-    print("Iniciando servidor Flask...")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
