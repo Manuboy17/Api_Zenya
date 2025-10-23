@@ -10,7 +10,7 @@ import io
 app = Flask(__name__)
 CORS(app)
 
-# ✅ CARGAR MODELO UNA SOLA VEZ (CACHE GLOBAL)
+# ✅ CARGAR MODELO
 print("🔄 Cargando modelo ONNX...")
 session_options = ort.SessionOptions()
 session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -18,14 +18,18 @@ session_options.intra_op_num_threads = 2
 session_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
 
 MODEL = ort.InferenceSession('best.onnx', session_options)
-print("✅ Modelo cargado y optimizado")
+print("✅ Modelo cargado")
 
-# Cargar clases
-with open('clases.txt', 'r') as f:
+with open('classes.txt', 'r') as f:
     CLASSES = [line.strip() for line in f.readlines()]
 
+print(f"📚 {len(CLASSES)} clases cargadas")
+
 def preprocess_image(image_base64):
-    """Preprocesar imagen base64 para el modelo YOLO"""
+    """
+    Preprocesamiento compatible con YOLOv5/v8
+    Formato estándar: RGB, 0-255, sin normalización
+    """
     try:
         # Decodificar base64
         image_data = base64.b64decode(image_base64)
@@ -33,34 +37,21 @@ def preprocess_image(image_base64):
         image = image.convert('RGB')
         image_np = np.array(image)
         
-        # ⚡ NUEVO: Redimensionar conservando aspect ratio
-        h, w = image_np.shape[:2]
-        scale = min(640/w, 640/h)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
+        # Redimensionar a 640x640 directamente (sin padding)
+        image_resized = cv2.resize(image_np, (640, 640), interpolation=cv2.INTER_LINEAR)
         
-        # Redimensionar
-        image_resized = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        # Formato YOLO: [batch, channels, height, width]
+        # Rango: 0-255 (sin normalizar)
+        image_transposed = np.transpose(image_resized, (2, 0, 1))  # HWC → CHW
+        image_batch = np.expand_dims(image_transposed, axis=0)  # Agregar batch
+        image_final = image_batch.astype(np.float32)  # Float32
         
-        # Crear canvas 640x640 negro
-        canvas = np.zeros((640, 640, 3), dtype=np.uint8)
+        print(f"📐 Shape: {image_final.shape}, Range: [{image_final.min():.0f}-{image_final.max():.0f}]")
         
-        # Centrar imagen en canvas
-        top = (640 - new_h) // 2
-        left = (640 - new_w) // 2
-        canvas[top:top+new_h, left:left+new_w] = image_resized
-        
-        # Normalizar y transponer
-        image_normalized = canvas.astype(np.float32) / 255.0
-        image_transposed = np.transpose(image_normalized, (2, 0, 1))
-        image_batch = np.expand_dims(image_transposed, axis=0)
-        
-        print(f"📐 Preprocesado: Original {w}x{h} → Resized {new_w}x{new_h} → Canvas 640x640")
-        
-        return image_batch
+        return image_final
         
     except Exception as e:
-        print(f"❌ Error en preprocesamiento: {str(e)}")
+        print(f"❌ Error preprocesamiento: {str(e)}")
         raise
 
 def apply_nms(boxes, scores, iou_threshold=0.45):
@@ -101,30 +92,23 @@ def apply_nms(boxes, scores, iou_threshold=0.45):
 def home():
     return jsonify({
         "status": "online",
-        "message": "API de detección de lengua de señas",
-        "model": "YOLO ONNX optimizado",
-        "version": "2.0",
-        "endpoints": {
-            "/": "GET - Info",
-            "/health": "GET - Health check",
-            "/test-predict": "GET - Test model",
-            "/predict": "POST - Predict sign language"
-        }
+        "message": "API Lengua de Señas",
+        "version": "3.0",
+        "classes": len(CLASSES)
     })
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "healthy", "model_loaded": MODEL is not None})
+    return jsonify({"status": "healthy", "model_loaded": True})
 
-@app.route('/test-predict', methods=['GET'])
+@app.route('/test-predict')
 def test_predict():
-    """Ruta para probar que el modelo funciona"""
     return jsonify({
-        "model_loaded": MODEL is not None,
-        "num_classes": len(CLASSES),
-        "classes_sample": CLASSES[:5],
-        "model_inputs": [inp.name for inp in MODEL.get_inputs()],
-        "model_outputs": [out.name for out in MODEL.get_outputs()]
+        "model_loaded": True,
+        "classes": len(CLASSES),
+        "classes_sample": CLASSES[:10],
+        "input_shape": str(MODEL.get_inputs()[0].shape),
+        "output_shape": str(MODEL.get_outputs()[0].shape)
     })
 
 @app.route('/predict', methods=['POST'])
@@ -132,64 +116,98 @@ def predict():
     try:
         data = request.get_json()
         image_base64 = data.get('image')
-        confidence_threshold = data.get('confidence', 0.1)  # ← Bajar a 0.1
-
+        confidence_threshold = data.get('confidence', 0.05)  # MUY BAJO
         iou_threshold = data.get('iou_threshold', 0.45)
         
         if not image_base64:
-            return jsonify({'success': False, 'error': 'No image provided'}), 400
+            return jsonify({'success': False, 'error': 'No image'}), 400
+        
+        print(f"\n{'='*60}")
+        print(f"📥 Threshold: {confidence_threshold}")
         
         # Preprocesar
         input_tensor = preprocess_image(image_base64)
         
         # Inferencia
         outputs = MODEL.run(None, {MODEL.get_inputs()[0].name: input_tensor})
-        predictions = outputs[0][0]
+        predictions = outputs[0][0]  # Shape: (85, 8400) para YOLOv5/v8
+        
+        print(f"📊 Output: {predictions.shape}")
+        
+        # Analizar confianzas
+        confidences = predictions[4, :]  # Fila de objectness
+        max_conf = confidences.max()
+        mean_conf = confidences.mean()
+        
+        print(f"📈 Max conf: {max_conf:.6f}")
+        print(f"📈 Mean conf: {mean_conf:.6f}")
+        print(f"📈 > 0.01: {(confidences > 0.01).sum()}")
+        print(f"📈 > 0.05: {(confidences > 0.05).sum()}")
+        print(f"📈 > 0.1: {(confidences > 0.1).sum()}")
+        print(f"📈 > 0.3: {(confidences > 0.3).sum()}")
         
         # Post-procesamiento
         boxes = []
         scores = []
         class_ids = []
-        raw_detections = 0
+        raw_count = 0
         
-        for detection in predictions.T:
-            confidence = detection[4]
-            if confidence > confidence_threshold:
-                raw_detections += 1
-                class_scores = detection[5:]
-                class_id = np.argmax(class_scores)
-                class_confidence = class_scores[class_id]
+        # Iterar sobre detecciones (8400 anchors)
+        for i in range(predictions.shape[1]):
+            objectness = predictions[4, i]  # Confianza de objeto
+            
+            if objectness > confidence_threshold:
+                raw_count += 1
                 
-                if class_confidence > confidence_threshold:
-                    x_center, y_center, width, height = detection[0:4]
+                # Clases (85 - 5 = 80 clases para COCO, o 27 para tu modelo)
+                class_scores = predictions[5:, i]
+                class_id = np.argmax(class_scores)
+                class_conf = class_scores[class_id]
+                
+                # Confianza final = objectness * class_confidence
+                final_confidence = objectness * class_conf
+                
+                if raw_count <= 3:  # Log solo primeras 3
+                    class_name = CLASSES[class_id] if class_id < len(CLASSES) else f'class_{class_id}'
+                    print(f"  🔸 #{raw_count}: obj={objectness:.4f}, cls={class_conf:.4f}, final={final_confidence:.4f}, class={class_name}")
+                
+                if final_confidence > confidence_threshold:
+                    # Coordenadas YOLO: [x_center, y_center, width, height]
+                    x_center = predictions[0, i]
+                    y_center = predictions[1, i]
+                    width = predictions[2, i]
+                    height = predictions[3, i]
+                    
+                    # Convertir a [x1, y1, x2, y2]
                     x1 = x_center - width / 2
                     y1 = y_center - height / 2
                     x2 = x_center + width / 2
                     y2 = y_center + height / 2
                     
                     boxes.append([x1, y1, x2, y2])
-                    scores.append(float(class_confidence))
+                    scores.append(float(final_confidence))
                     class_ids.append(int(class_id))
         
-        print(f"🔍 Raw: {raw_detections}, Filtered: {len(boxes)}")
+        print(f"🔍 Raw: {raw_count}, Filtered: {len(boxes)}")
         
         # NMS
         if len(boxes) > 0:
-            boxes = np.array(boxes)
-            scores = np.array(scores)
-            keep_indices = apply_nms(boxes, scores, iou_threshold)
+            boxes_array = np.array(boxes)
+            scores_array = np.array(scores)
+            keep = apply_nms(boxes_array, scores_array, iou_threshold)
             
-            final_boxes = boxes[keep_indices].tolist()
-            final_scores = [scores[i] for i in keep_indices]
-            final_class_ids = [class_ids[i] for i in keep_indices]
-            final_letters = [CLASSES[i] for i in final_class_ids]
+            final_boxes = boxes_array[keep].tolist()
+            final_scores = [scores_array[i] for i in keep]
+            final_class_ids = [class_ids[i] for i in keep]
+            final_letters = [CLASSES[cid] if cid < len(CLASSES) else f'class_{cid}' for cid in final_class_ids]
             
-            print(f"✅ Final: {len(keep_indices)}, Letters: {final_letters}")
+            print(f"✅ Final: {len(keep)}, Letters: {final_letters}")
+            print(f"{'='*60}\n")
             
             return jsonify({
                 'success': True,
                 'detections': {
-                    'num_detections': len(keep_indices),
+                    'num_detections': len(keep),
                     'boxes': final_boxes,
                     'scores': final_scores,
                     'class_ids': final_class_ids,
@@ -198,6 +216,7 @@ def predict():
             })
         
         print(f"❌ No detections")
+        print(f"{'='*60}\n")
         
         return jsonify({
             'success': True,
@@ -211,7 +230,9 @@ def predict():
         })
         
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.after_request
@@ -224,4 +245,6 @@ def after_request(response):
 if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    print(f"\n🚀 Servidor en puerto {port}")
+    print(f"📚 {len(CLASSES)} clases\n")
+    app.run(host='0.0.0.0', port=port, debug=False)
