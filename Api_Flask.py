@@ -14,14 +14,14 @@ CORS(app)
 print("🔄 Cargando modelo ONNX...")
 session_options = ort.SessionOptions()
 session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-session_options.intra_op_num_threads = 2  # Usar tus 2 vCPU
+session_options.intra_op_num_threads = 2
 session_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
 
 MODEL = ort.InferenceSession('best.onnx', session_options)
 print("✅ Modelo cargado y optimizado")
 
 # Cargar clases
-with open('clases.txt', 'r') as f:
+with open('classes.txt', 'r') as f:
     CLASSES = [line.strip() for line in f.readlines()]
 
 def preprocess_image(image_base64):
@@ -76,19 +76,36 @@ def home():
         "status": "online",
         "message": "API de detección de lengua de señas",
         "model": "YOLO ONNX optimizado",
-        "version": "2.0"
+        "version": "2.0",
+        "endpoints": {
+            "/": "GET - Info",
+            "/health": "GET - Health check",
+            "/test-predict": "GET - Test model",
+            "/predict": "POST - Predict sign language"
+        }
     })
 
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy", "model_loaded": MODEL is not None})
 
+@app.route('/test-predict', methods=['GET'])
+def test_predict():
+    """Ruta para probar que el modelo funciona"""
+    return jsonify({
+        "model_loaded": MODEL is not None,
+        "num_classes": len(CLASSES),
+        "classes_sample": CLASSES[:5],
+        "model_inputs": [inp.name for inp in MODEL.get_inputs()],
+        "model_outputs": [out.name for out in MODEL.get_outputs()]
+    })
+
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
         data = request.get_json()
         image_base64 = data.get('image')
-        confidence_threshold = data.get('confidence', 0.5)
+        confidence_threshold = data.get('confidence', 0.3)  # Bajado a 0.3
         iou_threshold = data.get('iou_threshold', 0.45)
         
         if not image_base64:
@@ -97,7 +114,7 @@ def predict():
         # Preprocesar
         input_tensor = preprocess_image(image_base64)
         
-        # ⚡ INFERENCIA RÁPIDA (modelo ya cargado)
+        # Inferencia
         outputs = MODEL.run(None, {MODEL.get_inputs()[0].name: input_tensor})
         predictions = outputs[0][0]
         
@@ -105,10 +122,12 @@ def predict():
         boxes = []
         scores = []
         class_ids = []
+        raw_detections = 0
         
         for detection in predictions.T:
             confidence = detection[4]
             if confidence > confidence_threshold:
+                raw_detections += 1
                 class_scores = detection[5:]
                 class_id = np.argmax(class_scores)
                 class_confidence = class_scores[class_id]
@@ -124,6 +143,8 @@ def predict():
                     scores.append(float(class_confidence))
                     class_ids.append(int(class_id))
         
+        print(f"🔍 Raw: {raw_detections}, Filtered: {len(boxes)}")
+        
         # NMS
         if len(boxes) > 0:
             boxes = np.array(boxes)
@@ -135,6 +156,8 @@ def predict():
             final_class_ids = [class_ids[i] for i in keep_indices]
             final_letters = [CLASSES[i] for i in final_class_ids]
             
+            print(f"✅ Final: {len(keep_indices)}, Letters: {final_letters}")
+            
             return jsonify({
                 'success': True,
                 'detections': {
@@ -145,6 +168,8 @@ def predict():
                     'letters': final_letters
                 }
             })
+        
+        print(f"❌ No detections")
         
         return jsonify({
             'success': True,
@@ -158,6 +183,7 @@ def predict():
         })
         
     except Exception as e:
+        print(f"❌ Error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.after_request
