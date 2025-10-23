@@ -20,7 +20,7 @@ session_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
 MODEL = ort.InferenceSession('best.onnx', session_options)
 print("✅ Modelo cargado")
 
-with open('classes.txt', 'r') as f:
+with open('clases.txt', 'r') as f:
     CLASSES = [line.strip() for line in f.readlines()]
 
 print(f"📚 {len(CLASSES)} clases cargadas")
