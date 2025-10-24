@@ -30,10 +30,15 @@ def preprocess_image(image_base64):
     image = image.convert('RGB')
     image_np = np.array(image)
     image_resized = cv2.resize(image_np, (640, 640))
-    image_normalized = image_resized.astype(np.float32) / 255.0
+    
+    # ⚡ SOLUCIÓN: Convertir a float32 ANTES de dividir
+    image_float = image_resized.astype(np.float32)
+    image_normalized = image_float / 255.0
+    
     image_transposed = np.transpose(image_normalized, (2, 0, 1))
     image_batch = np.expand_dims(image_transposed, axis=0)
     return image_batch
+
 
 def apply_nms(boxes, scores, iou_threshold=0.45):
     """NMS Original"""
