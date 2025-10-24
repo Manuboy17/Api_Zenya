@@ -26,10 +26,7 @@ with open('clases.txt', 'r') as f:
 print(f"📚 {len(CLASSES)} clases cargadas")
 
 def preprocess_image(image_base64):
-    """
-    Preprocesamiento NORMALIZADO (0-1)
-    La mayoría de modelos YOLO se entrenan así
-    """
+    """Versión con MEAN/STD normalization (ImageNet)"""
     try:
         image_data = base64.b64decode(image_base64)
         image = Image.open(io.BytesIO(image_data))
@@ -37,22 +34,28 @@ def preprocess_image(image_base64):
         image_np = np.array(image)
         
         # Redimensionar
-        image_resized = cv2.resize(image_np, (640, 640), interpolation=cv2.INTER_LINEAR)
+        image_resized = cv2.resize(image_np, (640, 640))
         
-        # ⚡ NORMALIZAR A [0, 1]
+        # Normalizar con ImageNet stats
         image_normalized = image_resized.astype(np.float32) / 255.0
+        
+        # ⚡ MEAN/STD normalization
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        
+        image_normalized = (image_normalized - mean) / std
         
         # Transponer
         image_transposed = np.transpose(image_normalized, (2, 0, 1))
         image_batch = np.expand_dims(image_transposed, axis=0)
         
-        print(f"📐 Normalizado [0-1]: Shape {image_batch.shape}, Range [{image_batch.min():.3f}-{image_batch.max():.3f}]")
+        print(f"📐 ImageNet norm: {image_batch.shape}, Range [{image_batch.min():.2f}-{image_batch.max():.2f}]")
         
         return image_batch
         
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
         raise
+
 
 
 def apply_nms(boxes, scores, iou_threshold=0.45):
